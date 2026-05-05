@@ -49,7 +49,7 @@ where
     P: for<'engine> PlatformApi<'engine>,
 {
     project: &'a Project,
-    scopes: ScopeMap<'a>,
+    scopes: ScopeMap<'a>, // (typeid, scope) -> (id, fcn)
     checkers: Vec<&'a Checker>,
     contexts: Vec<Option<CheckerContext>>,
     flirt_signature_entries: &'a BTreeMap<BlobTag, BTreeSet<String>>,
@@ -126,6 +126,10 @@ where
             .map(|(i, checker)| {
                 let tlib = checker.types();
 
+                // NOTE: It is possible that there are no applicable FLIRT libs
+                // available for a given checker under the current platform.
+                // In which case, we return a default BlobTag, which will be the
+                // same for all checkers with no FLIRT libs defined.
                 let stag = checker
                     .signature_arch_tags()
                     .get(project.lifter().translator().architecture())
@@ -169,6 +173,7 @@ where
         context: &'b mut Option<CheckerContext>,
         module_dir: Option<&Path>,
     ) -> Result<&'b mut CheckerContext, CheckerError> {
+        // We want Option::try_replace_with :)
         match context {
             None => {
                 let ctxt = checker.context(module_dir)?;
@@ -204,6 +209,11 @@ where
 
     fn build_caches(&mut self) -> Result<(), CheckerError> {
         for ((tlib, stag, _), _) in self.scopes.iter() {
+            // NOTE: here we need to build the appropriate signature mapping. This will be the same
+            // mapping for check contexts with the same signature tag, so we can take a
+            // representative checker, and it's signature configuration will work for all in the
+            // same (typing, signatures) grouping:
+            //
             let symbols = match self.flirt_symbols_cache.entry(*stag) {
                 Entry::Vacant(entry) => {
                     if let Some(entries) = self.flirt_signature_entries.get(stag) {
@@ -221,6 +231,12 @@ where
                 Entry::Occupied(entry) => entry.into_mut(),
             };
 
+            // NOTE: next we produce the type map for this set of checkers (if there is one)
+            //
+            // It's possible we have no type library, but we also (by the default type library
+            // association) have symbols via FLIRT that can be typed. So we also handle that case
+            // now.
+            //
             let tkey = (*tlib, *stag);
             if let Entry::Vacant(entry) = self.types_cache.entry(tkey) {
                 let tmap = if let Some(tlib) = tlib {
@@ -231,6 +247,12 @@ where
                     entry.insert(FunctionTypeMapping::from_project(self.project))
                 };
 
+                // Lastly, make sure that we have types for any FLIRT identified symbols.
+                //
+                // NOTE: This won't update the mapping in TypeDB such that we have an association
+                // of addr -> type based on the type mapping, so we need to keep this in mind
+                // within our AnnotatingPlatformTypeResolver.
+                //
                 symbols.update_type_mapping(tmap);
             }
         }
@@ -297,6 +319,10 @@ where
 
             match scope {
                 CheckScope::Calls(c) => {
+                    // NOTE: we may have imp.f specified, if so we will look for both imp.f and f
+                    // and merge the candidates.
+                    //
+                    // find all functions that call c.to()
                     let (all_to, with_jumps) = c.to().targets_with(self.project, symbols, true)?;
                     let blocks = self.project.code_blocks();
                     let icfg = self.project.icfg();
@@ -324,6 +350,7 @@ where
                         }
 
                         if candidates.is_empty() {
+                            // nothing to check beyond here
                             continue;
                         }
 
@@ -337,9 +364,10 @@ where
 
                         for (fid, blks) in candidates {
                             let f = &functions_kb[fid];
-                            let fctx = FunctionContext::new_with(f, self.project, &*symbols);
+                        let fctx = FunctionContext::new_with(f, self.project, &*symbols);
 
-                            if !c.eval_where(fctx.clone())? {
+                        // NOTE: the clone is cheap--just a few pointers
+                        if !c.eval_where(fctx.clone())? {
                                 continue;
                             }
 
@@ -464,9 +492,10 @@ where
                         for (fid, blks) in candidates {
                             let f = &functions[fid];
 
-                            let fctx = FunctionContext::new_with(f, self.project, &*symbols);
+                        let fctx = FunctionContext::new_with(f, self.project, &*symbols);
 
-                            if !c.eval_where(fctx.clone())? {
+                        // NOTE: the clone is cheap--just a few pointers
+                        if !c.eval_where(fctx.clone())? {
                                 continue;
                             }
 
@@ -735,9 +764,10 @@ where
                         for (fid, blks) in candidates {
                             let f = &functions[fid];
 
-                            let fctx = FunctionContext::new_with(f, self.project, &*symbols);
+                        let fctx = FunctionContext::new_with(f, self.project, &*symbols);
 
-                            if !c.eval_where(fctx.clone())? {
+                        // NOTE: the clone is cheap--just a few pointers
+                        if !c.eval_where(fctx.clone())? {
                                 continue;
                             }
 
