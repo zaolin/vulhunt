@@ -44,6 +44,11 @@ struct CheckCallWorkItem<'a> {
     tmap: &'a FunctionTypeMapping,
 }
 
+struct ParallelWork<'a> {
+    items: Vec<CheckCallWorkItem<'a>>,
+    processed_ids: BTreeSet<usize>,
+}
+
 pub struct Engine<'a, P>
 where
     P: for<'engine> PlatformApi<'engine>,
@@ -277,18 +282,24 @@ where
             return self.run_sequential(attrs);
         }
 
-        let (work_items, parallel_ids) = self.collect_parallel_work()?;
+        let work = self.collect_parallel_work()?;
 
-        if work_items.is_empty() || parallel_ids.is_empty() {
-            drop(work_items);
+        if work.items.is_empty() {
+            tracing::info!("parallel engine: no parallelizable work, falling back to sequential");
             return self.run_sequential(attrs);
         }
+
+        tracing::info!(
+            "parallel engine: dispatching {} call-site checks across {} threads",
+            work.items.len(),
+            num_cpus::get(),
+        );
 
         let mut parallel_checks: Vec<CheckResult> = Vec::new();
         {
             let results = Mutex::new(&mut parallel_checks);
 
-            work_items
+            work.items
                 .par_iter()
                 .try_for_each(|item| -> Result<(), CheckerError> {
                     if let Some(result) = self.execute_calls_work_item(item)? {
@@ -299,7 +310,7 @@ where
                 })?;
         }
 
-        let mut remaining = self.run_sequential_remaining(attrs, &parallel_ids)?;
+        let mut remaining = self.run_sequential_skipping(attrs, &work.processed_ids)?;
         parallel_checks.append(&mut remaining);
 
         Ok(parallel_checks)
@@ -307,10 +318,9 @@ where
 
     fn collect_parallel_work(
         &'a self,
-    ) -> Result<(Vec<CheckCallWorkItem<'a>>, BTreeSet<usize>), CheckerError> {
-        let mut work_items = Vec::new();
-        let mut parallel_ids = BTreeSet::new();
-        let mut has_decompiler = false;
+    ) -> Result<ParallelWork<'a>, CheckerError> {
+        let mut items = Vec::new();
+        let mut processed_ids = BTreeSet::new();
 
         for ((tlib, stag, scope), checkers) in self.scopes.iter() {
             let symbols = &self.flirt_symbols_cache[stag];
@@ -364,10 +374,10 @@ where
 
                         for (fid, blks) in candidates {
                             let f = &functions_kb[fid];
-                        let fctx = FunctionContext::new_with(f, self.project, &*symbols);
+                            let fctx = FunctionContext::new_with(f, self.project, &*symbols);
 
-                        // NOTE: the clone is cheap--just a few pointers
-                        if !c.eval_where(fctx.clone())? {
+                            // NOTE: the clone is cheap--just a few pointers
+                            if !c.eval_where(fctx.clone())? {
                                 continue;
                             }
 
@@ -382,11 +392,10 @@ where
                                 for (idx, handler) in checkers {
                                     let checker = &self.checkers[*idx];
                                     if checker.extensions().requires_decompiler() {
-                                        has_decompiler = true;
                                         continue;
                                     }
-                                    parallel_ids.insert(*idx);
-                                    work_items.push(CheckCallWorkItem {
+                                    processed_ids.insert(*idx);
+                                    items.push(CheckCallWorkItem {
                                         checker_idx: *idx,
                                         handler: (*handler).to_string(),
                                         project: self.project,
@@ -401,19 +410,14 @@ where
                         }
                     }
                 }
-                CheckScope::FunctionWith(_) | CheckScope::ProjectWith(_) => {
-                    for (idx, _) in checkers {
-                        let checker = &self.checkers[*idx];
-                        if checker.extensions().requires_decompiler() {
-                            has_decompiler = true;
-                        }
-                    }
-                }
+                _ => {}
             }
         }
 
-        let _ = has_decompiler;
-        Ok((work_items, parallel_ids))
+        Ok(ParallelWork {
+            items,
+            processed_ids,
+        })
     }
 
     fn execute_calls_work_item(
@@ -440,277 +444,13 @@ where
         &'engine mut self,
         attrs: &'attrs PlatformAttributes<'a>,
     ) -> Result<Vec<CheckResult>, CheckerError> {
-        let mut decompiler = None;
-        let mut checks = Vec::new();
-
-        for ((tlib, stag, scope), checkers) in self.scopes.iter() {
-            let symbols = &self.flirt_symbols_cache[stag];
-            let tkey = (*tlib, *stag);
-            let tmap = &self.types_cache[&tkey];
-
-            match scope {
-                CheckScope::Calls(c) => {
-                    let (all_to, with_jumps) = c.to().targets_with(self.project, symbols, true)?;
-
-                    let functions = self.project.functions();
-                    let blocks = self.project.code_blocks();
-                    let icfg = self.project.icfg();
-
-                    for to in all_to {
-                        let entry = blocks[to.entry()].node();
-                        let mut candidates = BTreeMap::<_, Vec<_>>::new();
-
-                        for (fid, blk) in icfg
-                            .edges_directed(entry, Direction::Incoming)
-                            .filter_map(|edge| {
-                                if edge.weight().is_call()
-                                    || (with_jumps && edge.weight().is_branch())
-                                {
-                                    let blk = &blocks[icfg[edge.source()]];
-                                    let fid = blk.function();
-                                    Some((fid, blk))
-                                } else {
-                                    None
-                                }
-                            })
-                        {
-                            candidates.entry(fid).or_default().push(blk);
-                        }
-
-                        if candidates.is_empty() {
-                            continue;
-                        }
-
-                        let resolver = AnnotatingPlatformTypeResolver::new_with(
-                            P::type_resolver(self.project),
-                            self.project,
-                            Cow::Borrowed(c.annotations()),
-                            symbols,
-                            tmap.types(),
-                        );
-
-                        for (fid, blks) in candidates {
-                            let f = &functions[fid];
-
-                        let fctx = FunctionContext::new_with(f, self.project, &*symbols);
-
-                        // NOTE: the clone is cheap--just a few pointers
-                        if !c.eval_where(fctx.clone())? {
-                                continue;
-                            }
-
-                            let aliases = Rc::new(TypedAliases::analyse_function_with(
-                                &*self.project, f, &resolver,
-                            ));
-
-                            for blk in blks {
-                                let bid = blk.id();
-                                let aliases = &aliases.blocks()[&bid];
-
-                                for (idx, handler) in checkers {
-                                    let checker = &self.checkers[*idx];
-                                    let context = Self::context_for(
-                                        checker,
-                                        &mut self.contexts[*idx],
-                                        self.module_dir.as_deref(),
-                                    )?;
-
-                                    let mut handle =
-                                        ProjectHandle::<P>::new(&*self.project, &*symbols, &*tmap);
-
-                                    if checker.extensions().requires_decompiler() {
-                                        let mut d = match decompiler {
-                                            None => decompiler.insert(
-                                                Decompiler::new_with_config(
-                                                    &*self.project,
-                                                    self.project.type_db(),
-                                                    DefaultDecompilerResolver::default(),
-                                                    self.decompiler_config.clone(),
-                                                )
-                                                .map_err(CheckerError::decompiler)?,
-                                            ),
-                                            Some(ref mut decompiler) => {
-                                                decompiler
-                                                    .clear()
-                                                    .map_err(CheckerError::decompiler)?;
-                                                decompiler
-                                            }
-                                        };
-                                        P::configure_decompiler(
-                                            &mut d,
-                                            self.project,
-                                            attrs,
-                                            Some(symbols),
-                                            Some(tmap),
-                                        )?;
-                                        handle.set_decompiler(d);
-                                    }
-
-                                    let ctx = CallSiteContext::new(
-                                        self.project, f, blk, aliases, symbols, tmap.types(),
-                                    );
-
-                                    let Some(result) = context.calls(handler, handle, ctx)? else {
-                                        continue;
-                                    };
-
-                                    checks.push(result.with_rule(*idx));
-                                }
-                            }
-                        }
-                    }
-                }
-                CheckScope::FunctionWith(c) => {
-                    if let Some(to) = c.target() {
-                        let all_to = to.targets_with(self.project, symbols, true)?;
-
-                        for f in all_to {
-                            for (idx, handler) in checkers {
-                                let checker = &self.checkers[*idx];
-                                let mut handle =
-                                    ProjectHandle::<P>::new(self.project, &*symbols, &*tmap);
-                                if checker.extensions().requires_decompiler() {
-                                    let mut d = match decompiler {
-                                        None => decompiler.insert(
-                                            Decompiler::new_with_config(
-                                                &*self.project,
-                                                self.project.type_db(),
-                                                DefaultDecompilerResolver::default(),
-                                                self.decompiler_config.clone(),
-                                            )
-                                            .map_err(CheckerError::decompiler)?,
-                                        ),
-                                        Some(ref mut decompiler) => {
-                                            decompiler.clear().map_err(CheckerError::decompiler)?;
-                                            decompiler
-                                        }
-                                    };
-                                    P::configure_decompiler(
-                                        &mut d,
-                                        &*self.project,
-                                        attrs,
-                                        Some(symbols),
-                                        Some(tmap),
-                                    )?;
-                                    handle.set_decompiler(d);
-                                }
-                                let context = Self::context_for(
-                                    checker,
-                                    &mut self.contexts[*idx],
-                                    self.module_dir.as_deref(),
-                                )?;
-                                let Some(result) = context.function_with(
-                                    handler,
-                                    handle,
-                                    FunctionContext::new_with(f, self.project, &*symbols),
-                                )?
-                                else {
-                                    continue;
-                                };
-                                checks.push(result.with_rule(*idx));
-                            }
-                        }
-                    } else if c.target().is_none() {
-                        tracing::trace!("analysing all functions");
-
-                        for f in self.project.functions().values() {
-                            for (idx, handler) in checkers {
-                                let checker = &self.checkers[*idx];
-                                let mut handle =
-                                    ProjectHandle::<P>::new(self.project, &*symbols, &*tmap);
-                                if checker.extensions().requires_decompiler() {
-                                    let mut d = match decompiler {
-                                        None => decompiler.insert(
-                                            Decompiler::new_with_config(
-                                                &*self.project,
-                                                self.project.type_db(),
-                                                DefaultDecompilerResolver::default(),
-                                                self.decompiler_config.clone(),
-                                            )
-                                            .map_err(CheckerError::decompiler)?,
-                                        ),
-                                        Some(ref mut decompiler) => {
-                                            decompiler.clear().map_err(CheckerError::decompiler)?;
-                                            decompiler
-                                        }
-                                    };
-                                    P::configure_decompiler(
-                                        &mut d,
-                                        &*self.project,
-                                        attrs,
-                                        Some(symbols),
-                                        Some(tmap),
-                                    )?;
-                                    handle.set_decompiler(d);
-                                }
-                                let context = Self::context_for(
-                                    checker,
-                                    &mut self.contexts[*idx],
-                                    self.module_dir.as_deref(),
-                                )?;
-                                let Some(result) = context.function_with(
-                                    handler,
-                                    handle,
-                                    FunctionContext::new_with(f, self.project, &*symbols),
-                                )?
-                                else {
-                                    continue;
-                                };
-                                checks.push(result.with_rule(*idx));
-                            }
-                        }
-                    }
-                }
-                CheckScope::ProjectWith(_) => {
-                    for (idx, handler) in checkers {
-                        let checker = &self.checkers[*idx];
-                        let mut handle = ProjectHandle::<P>::new(self.project, &*symbols, &*tmap);
-                        if checker.extensions().requires_decompiler() {
-                            let mut d = match decompiler {
-                                None => decompiler.insert(
-                                    Decompiler::new_with_config(
-                                        &*self.project,
-                                        self.project.type_db(),
-                                        DefaultDecompilerResolver::default(),
-                                        self.decompiler_config.clone(),
-                                    )
-                                    .map_err(CheckerError::decompiler)?,
-                                ),
-                                Some(ref mut decompiler) => {
-                                    decompiler.clear().map_err(CheckerError::decompiler)?;
-                                    decompiler
-                                }
-                            };
-                            P::configure_decompiler(
-                                &mut d,
-                                &*self.project,
-                                attrs,
-                                Some(symbols),
-                                Some(tmap),
-                            )?;
-                            handle.set_decompiler(d);
-                        }
-                        let context = Self::context_for(
-                            checker,
-                            &mut self.contexts[*idx],
-                            self.module_dir.as_deref(),
-                        )?;
-                        let Some(result) = context.project_with(handler, handle)? else {
-                            continue;
-                        };
-                        checks.push(result.with_rule(*idx));
-                    }
-                }
-            }
-        }
-
-        Ok(checks)
+        self.run_sequential_skipping(attrs, &BTreeSet::new())
     }
 
-    fn run_sequential_remaining<'engine, 'attrs>(
+    fn run_sequential_skipping<'engine, 'attrs>(
         &'engine mut self,
         attrs: &'attrs PlatformAttributes<'a>,
-        parallel_ids: &BTreeSet<usize>,
+        skip_ids: &BTreeSet<usize>,
     ) -> Result<Vec<CheckResult>, CheckerError> {
         let mut decompiler = None;
         let mut checks = Vec::new();
@@ -764,10 +504,10 @@ where
                         for (fid, blks) in candidates {
                             let f = &functions[fid];
 
-                        let fctx = FunctionContext::new_with(f, self.project, &*symbols);
+                            let fctx = FunctionContext::new_with(f, self.project, &*symbols);
 
-                        // NOTE: the clone is cheap--just a few pointers
-                        if !c.eval_where(fctx.clone())? {
+                            // NOTE: the clone is cheap--just a few pointers
+                            if !c.eval_where(fctx.clone())? {
                                 continue;
                             }
 
@@ -780,7 +520,7 @@ where
                                 let aliases = &aliases.blocks()[&bid];
 
                                 for (idx, handler) in checkers {
-                                    if parallel_ids.contains(idx) {
+                                    if skip_ids.contains(idx) {
                                         continue;
                                     }
                                     let checker = &self.checkers[*idx];
@@ -841,9 +581,6 @@ where
 
                         for f in all_to {
                             for (idx, handler) in checkers {
-                                if parallel_ids.contains(idx) {
-                                    continue;
-                                }
                                 let checker = &self.checkers[*idx];
                                 let mut handle =
                                     ProjectHandle::<P>::new(self.project, &*symbols, &*tmap);
@@ -893,9 +630,6 @@ where
 
                         for f in self.project.functions().values() {
                             for (idx, handler) in checkers {
-                                if parallel_ids.contains(idx) {
-                                    continue;
-                                }
                                 let checker = &self.checkers[*idx];
                                 let mut handle =
                                     ProjectHandle::<P>::new(self.project, &*symbols, &*tmap);
@@ -944,9 +678,6 @@ where
                 }
                 CheckScope::ProjectWith(_) => {
                     for (idx, handler) in checkers {
-                        if parallel_ids.contains(idx) {
-                            continue;
-                        }
                         let checker = &self.checkers[*idx];
                         let mut handle = ProjectHandle::<P>::new(self.project, &*symbols, &*tmap);
                         if checker.extensions().requires_decompiler() {
