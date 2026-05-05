@@ -143,7 +143,7 @@ impl Checker {
         )
     }
 
-    fn new_vm(name: &str, code: &[u8], module_dir: Option<&Path>) -> Result<Lua, CheckerError> {
+    pub(crate) fn new_vm(name: &str, code: &[u8], module_dir: Option<&Path>) -> Result<Lua, CheckerError> {
         let context = unsafe { Lua::unsafe_new() };
 
         // Load the Rust FFI ctors
@@ -424,6 +424,13 @@ impl Checker {
 }
 
 impl CheckerContext {
+    pub fn from_checker(
+        checker: &Checker,
+        module_dir: Option<&Path>,
+    ) -> Result<Self, CheckerError> {
+        Checker::new_vm(&checker.name, &checker.code, module_dir).map(CheckerContext)
+    }
+
     #[inline]
     pub fn calls<'a, 'd, 'c, P>(
         &self,
