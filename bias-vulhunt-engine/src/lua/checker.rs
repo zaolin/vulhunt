@@ -521,3 +521,81 @@ impl CheckerContext {
             .map_err(CheckerError::Run)
     }
 }
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    const SAMPLE_RULE: &str = r#"
+        name = "test-checker"
+        author = "test-author"
+        platform = "efi"
+        architecture = "X86:LE:64"
+        scopes = {
+            {
+                kind = "calls",
+                to = "memcpy",
+                with = "check_calls",
+                using = {},
+            }
+        }
+        function check_calls(project, context)
+            return nil
+        end
+    "#;
+
+    #[test]
+    fn test_checker_from_str() {
+        let checker = Checker::from_str("test.vh", SAMPLE_RULE, VulHuntModuleDir::none())
+            .expect("should parse valid rule");
+        assert_eq!(checker.name(), "test-checker");
+        assert_eq!(checker.author(), "test-author");
+        assert_eq!(checker.platform(), "efi");
+        assert_eq!(checker.architecture().len(), 1);
+        assert_eq!(checker.scopes().len(), 1);
+        assert!(!checker.extensions().requires_decompiler());
+    }
+
+    #[test]
+    fn test_checker_extensions_decompiler() {
+        let rule = r#"
+            name = "decomp-checker"
+            author = "test"
+            platform = "efi"
+            architecture = "X86:LE:64"
+            extensions = {"decompiler"}
+            scopes = {
+                {
+                    kind = "calls",
+                    to = "memcpy",
+                    with = "check_calls",
+                    using = {},
+                }
+            }
+            function check_calls(project, context)
+                return nil
+            end
+        "#;
+        let checker = Checker::from_str("test.vh", rule, VulHuntModuleDir::none())
+            .expect("should parse rule with decompiler extension");
+        assert!(checker.extensions().requires_decompiler());
+    }
+
+    #[test]
+    fn test_context_from_checker() {
+        let checker = Checker::from_str("test.vh", SAMPLE_RULE, VulHuntModuleDir::none())
+            .expect("should parse valid rule");
+        let ctx = CheckerContext::from_checker(&checker, None)
+            .expect("should create context from checker");
+        let _ = ctx;
+    }
+
+    #[test]
+    fn test_from_checker_preserves_code() {
+        let checker = Checker::from_str("test.vh", SAMPLE_RULE, VulHuntModuleDir::none()).unwrap();
+        let ctx1 = CheckerContext::from_checker(&checker, None).unwrap();
+        let ctx2 = CheckerContext::from_checker(&checker, None).unwrap();
+        drop(ctx1);
+        drop(ctx2);
+    }
+}

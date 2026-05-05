@@ -278,37 +278,53 @@ where
     ) -> Result<Vec<CheckResult>, CheckerError> {
         self.build_caches()?;
 
+        tracing::debug!(
+            "engine {} parallel mode ({} CPUs)",
+            if self.parallel { "will attempt" } else { "in" },
+            num_cpus::get(),
+        );
+
         if !self.parallel {
+            tracing::debug!("parallel disabled (< 2 CPUs), running sequential");
             return self.run_sequential(attrs);
         }
 
         let work = self.collect_parallel_work()?;
 
         if work.items.is_empty() {
-            tracing::info!("parallel engine: no parallelizable work, falling back to sequential");
+            tracing::debug!(
+                "parallel engine: all {} scopes use non-Calls kind or require decompiler; \
+                 running sequential (enable RUST_LOG=debug for details)",
+                self.scopes.len(),
+            );
             return self.run_sequential(attrs);
         }
 
-        tracing::info!(
+        tracing::debug!(
             "parallel engine: dispatching {} call-site checks across {} threads",
             work.items.len(),
             num_cpus::get(),
         );
 
         let mut parallel_checks: Vec<CheckResult> = Vec::new();
-        {
-            let results = Mutex::new(&mut parallel_checks);
+        let results = Mutex::new(&mut parallel_checks);
 
-            work.items
-                .par_iter()
-                .try_for_each(|item| -> Result<(), CheckerError> {
-                    if let Some(result) = self.execute_calls_work_item(item)? {
-                        let mut guard = results.lock().unwrap();
-                        guard.push(result.with_rule(item.checker_idx));
-                    }
-                    Ok(())
-                })?;
-        }
+        work.items
+            .par_iter()
+            .try_for_each(|item| -> Result<(), CheckerError> {
+                if let Some(result) = self.execute_calls_work_item(item)? {
+                    let mut guard = results.lock().unwrap();
+                    guard.push(result.with_rule(item.checker_idx));
+                }
+                Ok(())
+            })?;
+
+        drop(results);
+
+        tracing::debug!(
+            "parallel dispatch complete, running sequential for remaining {} scopes",
+            self.scopes.len(),
+        );
 
         let mut remaining = self.run_sequential_skipping(attrs, &work.processed_ids)?;
         parallel_checks.append(&mut remaining);
@@ -321,14 +337,20 @@ where
     ) -> Result<ParallelWork<'a>, CheckerError> {
         let mut items = Vec::new();
         let mut processed_ids = BTreeSet::new();
+        let mut scope_count = 0usize;
+        let mut calls_total = 0usize;
+        let mut calls_decompiler = 0usize;
+        let mut calls_other = 0usize;
 
         for ((tlib, stag, scope), checkers) in self.scopes.iter() {
+            scope_count += 1;
             let symbols = &self.flirt_symbols_cache[stag];
             let tkey = (*tlib, *stag);
             let tmap = &self.types_cache[&tkey];
 
             match scope {
                 CheckScope::Calls(c) => {
+                    calls_total += 1;
                     // NOTE: we may have imp.f specified, if so we will look for both imp.f and f
                     // and merge the candidates.
                     //
@@ -337,6 +359,11 @@ where
                     let blocks = self.project.code_blocks();
                     let icfg = self.project.icfg();
                     let functions_kb = self.project.functions();
+
+                    let mut skipped_decompiler = 0usize;
+                    let mut skipped_condition = 0usize;
+                    let mut skipped_empty = 0usize;
+                    let mut collected = 0usize;
 
                     for to in all_to {
                         let entry = blocks[to.entry()].node();
@@ -361,6 +388,7 @@ where
 
                         if candidates.is_empty() {
                             // nothing to check beyond here
+                            skipped_empty += 1;
                             continue;
                         }
 
@@ -378,6 +406,7 @@ where
 
                             // NOTE: the clone is cheap--just a few pointers
                             if !c.eval_where(fctx.clone())? {
+                                skipped_condition += 1;
                                 continue;
                             }
 
@@ -392,8 +421,10 @@ where
                                 for (idx, handler) in checkers {
                                     let checker = &self.checkers[*idx];
                                     if checker.extensions().requires_decompiler() {
+                                        skipped_decompiler += 1;
                                         continue;
                                     }
+                                    collected += 1;
                                     processed_ids.insert(*idx);
                                     items.push(CheckCallWorkItem {
                                         checker_idx: *idx,
@@ -409,9 +440,51 @@ where
                             }
                         }
                     }
+
+                    if collected == 0 {
+                        tracing::debug!(
+                            "calls scope: 0 items ({} decompiler-only checkers, {} condition-skipped, {} empty candidates)",
+                            skipped_decompiler,
+                            skipped_condition,
+                            skipped_empty,
+                        );
+                    } else {
+                        tracing::debug!(
+                            "calls scope: {} parallel items ({} decomp-skipped, {} cond-skipped, {} empty)",
+                            collected,
+                            skipped_decompiler,
+                            skipped_condition,
+                            skipped_empty,
+                        );
+                    }
+
+                    if skipped_decompiler > 0 {
+                        calls_decompiler += 1;
+                    }
                 }
-                _ => {}
+                kind => {
+                    let kind_name = match kind {
+                        CheckScope::FunctionWith(_) => "functions",
+                        CheckScope::ProjectWith(_) => "project",
+                        _ => unreachable!(),
+                    };
+                    tracing::debug!(
+                        "{} scope: running sequentially (not parallelizable)",
+                        kind_name,
+                    );
+                    calls_other += 1;
+                }
             }
+        }
+
+        if items.is_empty() {
+            tracing::debug!(
+                "total {} scopes, {} calls ({} non-Calls, {} w/decompiler-only checkers): nothing to parallelize",
+                scope_count,
+                calls_total,
+                calls_other,
+                calls_decompiler,
+            );
         }
 
         Ok(ParallelWork {
@@ -720,5 +793,16 @@ where
         }
 
         Ok(checks)
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn test_parallel_detects_cpu_count() {
+        let cpu_count = num_cpus::get();
+        assert!(cpu_count >= 1);
     }
 }
